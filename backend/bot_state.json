@@ -1,0 +1,19 @@
+{
+  "mode": "PAPER",
+  "starting_equity": 10000.0,
+  "active_equity": 10000.0,
+  "peak_equity": 10000.0,
+  "vault_balance": 0.0,
+  "principal_siphoned": false,
+  "next_siphon_milestone": 20000.0,
+  "wins": 0,
+  "losses": 0,
+  "total_closed_trades": 0,
+  "win_rate_pct": 0.0,
+  "gross_profit_inr": 0.0,
+  "gross_loss_inr": 0.0,
+  "net_realized_pnl_inr": 0.0,
+  "trade_history": [],
+  "siphon_history": [],
+  "recent_notifications": []
+}

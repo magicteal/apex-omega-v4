@@ -1,0 +1,21 @@
+# Environments and Dependencies
+.env
+.venv/
+venv/
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Logs & System
+*.log
+.DS_Store
+Thumbs.db
