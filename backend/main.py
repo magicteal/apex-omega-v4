@@ -454,9 +454,9 @@ async def start_background_scanner() -> None:
     asyncio.create_task(loop())
 
 
-@app.get("/")
-@app.get("/health")
-@app.get("/api/ping")
+@app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"])
+@app.api_route("/api/ping", methods=["GET", "HEAD"])
 async def health_check() -> Dict[str, Any]:
     """UptimeRobot 24/7 Keep-Alive Endpoint"""
     return {
