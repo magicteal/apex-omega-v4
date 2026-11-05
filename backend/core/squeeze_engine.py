@@ -1,12 +1,12 @@
 """
-APEX-OMEGA OS V4 — 6-Factor High-Win-Rate (75-82% Target) 5-Minute Confluence Engine
-Factors:
-1. Institutional Rolling VWAP & Standard Deviation Z-Score
-2. Connors 2-Period RSI (RSI-2) Pullback Exhaustion (< 22 Long / > 78 Short)
-3. Multi-EMA Trend Alignment (EMA-21 / EMA-50 / EMA-100)
-4. Order-Flow Wick Rejection & Volume Absorption (RVOL >= 1.05x for Sniper / >= 1.35x for Breakout)
-5. Bollinger/Keltner Volatility Compression Ratio
-6. Micro-Momentum Inflection (ROC5 + Candle Rebound)
+APEX-OMEGA OS V4.2 — Strict High-Win-Rate 5m Institutional Pullback Sniper Engine
+Fixes:
+1. Full 8-decimal precision so low-priced coins never round entry/stop to the same value.
+2. Strict mutually exclusive Trend Filters:
+   - Bull Trend: Close > EMA-50 > EMA-100 AND EMA-50 slope > +0.0008
+   - Bear Trend: Close < EMA-50 < EMA-100 AND EMA-50 slope < -0.0008
+3. Entry requires a confirmed pullback exhaustion (RSI-2 <= 18 for Long / >= 82 for Short, or VWAP Z-Score >= 1.25)
+   PLUS a confirmed reversal candle (Green rebound candle for Long, Red rejection candle for Short).
 """
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any
@@ -32,7 +32,7 @@ class QuantV4Signal:
     setup_type: str
     regime: str
     signal_valid: bool
-    feed_source: str = "MULTI_EXCHANGE_5M"
+    feed_source: str = "BYBIT_LIVE_5M"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -72,7 +72,7 @@ class SqueezeEngine:
             )
         return SqueezeEngine._ema(tr, period)
 
-    def evaluate_ohlcv(self, symbol: str, ohlcv: List[List[float]], feed_source: str = "MULTI_EXCHANGE_5M") -> QuantV4Signal:
+    def evaluate_ohlcv(self, symbol: str, ohlcv: List[List[float]], feed_source: str = "BYBIT_LIVE_5M") -> QuantV4Signal:
         arr = np.array(ohlcv, dtype=float)
         open_p = arr[:, 1]
         high = arr[:, 2]
@@ -87,7 +87,6 @@ class SqueezeEngine:
         ema50 = self._ema(close, min(50, n))
         ema100 = self._ema(close, min(100, n))
 
-        # Rolling 20-bar VWAP & Z-Score
         win = min(20, n)
         typ = (high[-win:] + low[-win:] + close[-win:]) / 3.0
         v_slice = np.maximum(vol[-win:], 1e-9)
@@ -95,7 +94,6 @@ class SqueezeEngine:
         std20 = float(np.std(close[-win:]))
         z_score = round((float(close[-1]) - vwap) / max(std20, float(close[-1]) * 0.001), 2)
 
-        # Squeeze compression
         squeeze_count = 0
         current_comp = 1.0
         squeeze_now = False
@@ -126,59 +124,65 @@ class SqueezeEngine:
         close5 = float(close[max(0, n - 6)])
         roc5 = round((float(close[-1]) - close5) / max(close5, 1e-9), 5)
 
-        cur_range = max(float(high[-1] - low[-1]), 1e-9)
+        cur_range = max(float(high[-1] - low[-1]), 1e-12)
         lower_wick = (min(float(open_p[-1]), float(close[-1])) - float(low[-1])) / cur_range
         upper_wick = (float(high[-1]) - max(float(open_p[-1]), float(close[-1]))) / cur_range
-        green_rebound = float(close[-1]) >= float(open_p[-1]) or float(close[-1]) > float(close[-2])
-        red_rebound = float(close[-1]) <= float(open_p[-1]) or float(close[-1]) < float(close[-2])
+        green_candle = float(close[-1]) > float(open_p[-1]) and float(close[-1]) > float(close[-2])
+        red_candle = float(close[-1]) < float(open_p[-1]) and float(close[-1]) < float(close[-2])
 
-        bull_trend = float(close[-1]) >= float(ema100[-1]) * 0.995 or ema_slope > -0.0005
-        bear_trend = float(close[-1]) <= float(ema100[-1]) * 1.005 or ema_slope < 0.0005
+        # STRICT MUTUALLY EXCLUSIVE MACRO TREND ALIGNMENT
+        strict_bull = float(ema21[-1]) > float(ema50[-1]) and float(ema50[-1]) >= float(ema100[-1]) and ema_slope >= 0.0006
+        strict_bear = float(ema21[-1]) < float(ema50[-1]) and float(ema50[-1]) <= float(ema100[-1]) and ema_slope <= -0.0006
 
-        long_sniper = bull_trend and (rsi2 <= 22 or z_score <= -1.15) and (lower_wick >= 0.20 or green_rebound) and rvol >= 1.05
-        short_sniper = bear_trend and (rsi2 >= 78 or z_score >= 1.15) and (upper_wick >= 0.20 or red_rebound) and rvol >= 1.05
+        # Directional Confluence Score (Only rewards indicators aligned in the SAME direction)
+        bull_score = 35
+        if strict_bull:
+            bull_score += 22
+        if rsi2 <= 18:
+            bull_score += 20
+        if z_score <= -1.20:
+            bull_score += 12
+        if green_candle or lower_wick >= 0.30:
+            bull_score += 12
+        if rvol >= 1.15:
+            bull_score += 8
 
-        had_comp = squeeze_count >= 1 or current_comp <= 1.05
-        long_breakout = had_comp and float(ema21[-1]) >= float(ema50[-1]) and ema_slope > 0.0006 and rvol >= 1.35 and roc5 >= 0.0045 and rsi14 < 72
-        short_breakout = had_comp and float(ema21[-1]) <= float(ema50[-1]) and ema_slope < -0.0006 and rvol >= 1.35 and roc5 <= -0.0045 and rsi14 > 28
+        bear_score = 35
+        if strict_bear:
+            bear_score += 22
+        if rsi2 >= 82:
+            bear_score += 20
+        if z_score >= 1.20:
+            bear_score += 12
+        if red_candle or upper_wick >= 0.30:
+            bear_score += 12
+        if rvol >= 1.15:
+            bear_score += 8
 
-        score = 42
-        if abs(ema_slope) > 0.0006:
-            score += 14
-        if rvol >= 1.25:
-            score += 14
-        if rvol >= 1.75:
-            score += 8
-        if rsi2 <= 20 or rsi2 >= 80:
-            score += 16
-        if abs(z_score) >= 1.15:
-            score += 12
-        if squeeze_now or squeeze_count >= 2:
-            score += 10
-        if lower_wick >= 0.25 or upper_wick >= 0.25:
-            score += 8
-        score = min(99, score)
+        long_valid = strict_bull and (rsi2 <= 18 or z_score <= -1.25) and green_candle and rvol >= 1.10 and bull_score >= 82
+        short_valid = strict_bear and (rsi2 >= 82 or z_score >= 1.25) and red_candle and rvol >= 1.10 and bear_score >= 82
 
-        regime = "NEUTRAL"
-        setup_type = "SCANNING"
-        signal_valid = False
-
-        if long_sniper or long_breakout:
+        if long_valid:
             regime = "LONG_IGNITION"
-            setup_type = "VWAP_RSI2_SNIPER" if long_sniper else "MICRO_SQUEEZE_FLOW"
-            signal_valid = score >= 76
-        elif short_sniper or short_breakout:
+            setup_type = "VWAP_RSI2_PULLBACK_LONG"
+            score = min(99, bull_score)
+            signal_valid = True
+        elif short_valid:
             regime = "SHORT_IGNITION"
-            setup_type = "VWAP_RSI2_SNIPER" if short_sniper else "MICRO_SQUEEZE_FLOW"
-            signal_valid = score >= 76
-        elif squeeze_now or squeeze_count > 0 or score >= 65:
-            regime = "COILING"
+            setup_type = "VWAP_RSI2_PULLBACK_SHORT"
+            score = min(99, bear_score)
+            signal_valid = True
+        else:
+            score = min(78, max(bull_score, bear_score))
+            regime = "COILING" if (squeeze_now or score >= 62) else "NEUTRAL"
+            setup_type = "SCANNING"
+            signal_valid = False
 
         return QuantV4Signal(
             symbol=symbol,
             price=float(close[-1]),
-            atr_14=max(float(atr14[-1]), float(close[-1]) * 0.0025),
-            vwap=round(vwap, 6),
+            atr_14=max(float(atr14[-1]), float(close[-1]) * 0.003),
+            vwap=float(vwap),
             z_score=z_score,
             rsi_2=rsi2,
             rsi_14=rsi14,

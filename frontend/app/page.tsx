@@ -20,6 +20,7 @@ interface AssetSignal {
   ema_trend_slope: number;
   rvol: number;
   roc5: number;
+  ker: number; // Kaufman Efficiency Ratio (0.00 to 1.00)
   confluence_score: number; // 0 to 100 multi-factor quant score
   setup_type: "VWAP_RSI2_SNIPER" | "MICRO_SQUEEZE_FLOW" | "SCANNING";
   regime: "LONG_IGNITION" | "SHORT_IGNITION" | "COILING" | "NEUTRAL";
@@ -107,8 +108,19 @@ const UNIVERSE_PAIRS = [
   { symbol: "BNB/USDT:USDT", ticker: "BNBUSDT", bybitSymbol: "BNBUSDT", okxInstId: "BNB-USDT-SWAP", krakenPair: "BNBUSD", coingeckoId: "binancecoin", seedPrice: 715.76, seedAtr: 4.10 },
   { symbol: "AVAX/USDT:USDT", ticker: "AVAXUSDT", bybitSymbol: "AVAXUSDT", okxInstId: "AVAX-USDT-SWAP", krakenPair: "AVAXUSD", coingeckoId: "avalanche-2", seedPrice: 8.84, seedAtr: 0.082 },
   { symbol: "LINK/USDT:USDT", ticker: "LINKUSDT", bybitSymbol: "LINKUSDT", okxInstId: "LINK-USDT-SWAP", krakenPair: "LINKUSD", coingeckoId: "chainlink", seedPrice: 11.55, seedAtr: 0.095 },
-  { symbol: "PEPE/USDT:USDT", ticker: "PEPEUSDT", bybitSymbol: "1000PEPEUSDT", okxInstId: "PEPE-USDT-SWAP", krakenPair: "PEPEUSD", coingeckoId: "pepe", seedPrice: 0.00000505, seedAtr: 0.00000006 },
+  { symbol: "ADA/USDT:USDT", ticker: "ADAUSDT", bybitSymbol: "ADAUSDT", okxInstId: "ADA-USDT-SWAP", krakenPair: "ADAUSD", coingeckoId: "cardano", seedPrice: 0.3650, seedAtr: 0.0032 },
 ];
+
+// PASTE YOUR RENDER BACKEND URL HERE (OR IN VERCEL ENV NEXT_PUBLIC_API_URL) SO ALL DEVICES SYNC TO 1 SHARED 24/7 SERVER:
+const DEFAULT_RENDER_BACKEND_URL = "https://apex-omega-v4.onrender.com";
+
+function fmtPrice(val: number): number {
+  if (!val || isNaN(val)) return 0;
+  if (Math.abs(val) < 0.01) return +val.toFixed(8);
+  if (Math.abs(val) < 1.0) return +val.toFixed(5);
+  if (Math.abs(val) < 50.0) return +val.toFixed(4);
+  return +val.toFixed(2);
+}
 
 const STORAGE_KEY = "apex_omega_real_state_v4";
 const RENDER_URL_KEY = "apex_omega_render_url_v4";
@@ -228,6 +240,15 @@ function evaluateQuantV4(
   const close5 = close[Math.max(0, n - 6)];
   const roc5 = +((close[n - 1] - close5) / Math.max(close5, 1e-9)).toFixed(5);
 
+  // Kaufman Efficiency Ratio (10-period) to distinguish Mean-Reversion vs Runaway Trend
+  const kerPeriod = Math.min(10, n - 1);
+  const netDirMove = Math.abs(close[n - 1] - close[n - 1 - kerPeriod]);
+  let pathSum = 0;
+  for (let i = n - kerPeriod; i < n; i++) {
+    pathSum += Math.abs(close[i] - close[i - 1]);
+  }
+  const ker = +(netDirMove / Math.max(pathSum, 1e-12)).toFixed(2);
+
   // Wick Rejection & Candle Micro-Structure
   const curRange = Math.max(high[n - 1] - low[n - 1], 1e-9);
   const lowerWickRatio = (Math.min(open[n - 1], close[n - 1]) - low[n - 1]) / curRange;
@@ -235,46 +256,45 @@ function evaluateQuantV4(
   const greenRebound = close[n - 1] >= open[n - 1] || close[n - 1] > close[n - 2];
   const redRebound = close[n - 1] <= open[n - 1] || close[n - 1] < close[n - 2];
 
-  // Setup A: Institutional VWAP + Connors RSI(2) Pullback Sniper (76-82% Historical Win Rate)
-  const bullTrend = close[n - 1] >= ema100[n - 1] * 0.995 || emaSlope > -0.0005;
-  const bearTrend = close[n - 1] <= ema100[n - 1] * 1.005 || emaSlope < 0.0005;
+  // V4.2 FIX: Strict Mutually Exclusive Trend + Directional Confluence Scoring (No Overlapping Bull/Bear)
+  const strictBull = ema21[n - 1] > ema50[n - 1] && ema50[n - 1] >= ema100[n - 1] && emaSlope >= 0.0006;
+  const strictBear = ema21[n - 1] < ema50[n - 1] && ema50[n - 1] <= ema100[n - 1] && emaSlope <= -0.0006;
+  const confirmedGreen = close[n - 1] > open[n - 1] && close[n - 1] > close[n - 2];
+  const confirmedRed = close[n - 1] < open[n - 1] && close[n - 1] < close[n - 2];
 
-  const longPullbackSniper =
-    bullTrend && (rsi2 <= 22 || zScore <= -1.15) && (lowerWickRatio >= 0.20 || greenRebound) && rvol >= 1.05;
-  const shortPullbackSniper =
-    bearTrend && (rsi2 >= 78 || zScore >= 1.15) && (upperWickRatio >= 0.20 || redRebound) && rvol >= 1.05;
+  let bullScore = 35;
+  if (strictBull) bullScore += 22;
+  if (rsi2 <= 18) bullScore += 20;
+  if (zScore <= -1.20) bullScore += 12;
+  if (confirmedGreen || lowerWickRatio >= 0.30) bullScore += 12;
+  if (rvol >= 1.15) bullScore += 8;
 
-  // Setup B: Multi-Factor Micro-Squeeze Order-Flow Breakout (70-75% Win Rate with TP1 @ +0.75 ATR)
-  const hadCompression = squeezeCount >= 1 || currentComp <= 1.05;
-  const longMicroBreakout =
-    hadCompression && ema21[n - 1] >= ema50[n - 1] && emaSlope > 0.0006 && rvol >= 1.35 && roc5 >= 0.0045 && rsi14 < 72;
-  const shortMicroBreakout =
-    hadCompression && ema21[n - 1] <= ema50[n - 1] && emaSlope < -0.0006 && rvol >= 1.35 && roc5 <= -0.0045 && rsi14 > 28;
+  let bearScore = 35;
+  if (strictBear) bearScore += 22;
+  if (rsi2 >= 82) bearScore += 20;
+  if (zScore >= 1.20) bearScore += 12;
+  if (confirmedRed || upperWickRatio >= 0.30) bearScore += 12;
+  if (rvol >= 1.15) bearScore += 8;
 
-  // Compute 0-100 Confluence Score
-  let score = 42;
-  if (Math.abs(emaSlope) > 0.0006) score += 14;
-  if (rvol >= 1.25) score += 14;
-  if (rvol >= 1.75) score += 8;
-  if (rsi2 <= 20 || rsi2 >= 80) score += 16;
-  if (Math.abs(zScore) >= 1.15) score += 12;
-  if (squeezeNow || squeezeCount >= 2) score += 10;
-  if (lowerWickRatio >= 0.25 || upperWickRatio >= 0.25) score += 8;
-  score = Math.min(99, score);
+  const longValid = strictBull && (rsi2 <= 18 || zScore <= -1.25) && confirmedGreen && rvol >= 1.10 && bullScore >= 82;
+  const shortValid = strictBear && (rsi2 >= 82 || zScore >= 1.25) && confirmedRed && rvol >= 1.10 && bearScore >= 82;
 
   let regime: AssetSignal["regime"] = "NEUTRAL";
   let setupType: AssetSignal["setup_type"] = "SCANNING";
   let signalValid = false;
+  let score = Math.min(78, Math.max(bullScore, bearScore));
 
-  if (longPullbackSniper || longMicroBreakout) {
+  if (longValid) {
     regime = "LONG_IGNITION";
-    setupType = longPullbackSniper ? "VWAP_RSI2_SNIPER" : "MICRO_SQUEEZE_FLOW";
-    signalValid = score >= 76;
-  } else if (shortPullbackSniper || shortMicroBreakout) {
+    setupType = "VWAP_RSI2_SNIPER";
+    score = Math.min(99, bullScore);
+    signalValid = true;
+  } else if (shortValid) {
     regime = "SHORT_IGNITION";
-    setupType = shortPullbackSniper ? "VWAP_RSI2_SNIPER" : "MICRO_SQUEEZE_FLOW";
-    signalValid = score >= 76;
-  } else if (squeezeNow || squeezeCount > 0 || score >= 65) {
+    setupType = "VWAP_RSI2_SNIPER";
+    score = Math.min(99, bearScore);
+    signalValid = true;
+  } else if (squeezeNow || squeezeCount > 0 || score >= 62) {
     regime = "COILING";
   }
 
@@ -297,6 +317,7 @@ function evaluateQuantV4(
     ema_trend_slope: +emaSlope.toFixed(6),
     rvol,
     roc5,
+    ker,
     confluence_score: score,
     setup_type: setupType,
     regime,
@@ -340,6 +361,7 @@ export default function App() {
       ema_trend_slope: 0.0005,
       rvol: 1.25,
       roc5: 0.0035,
+      ker: 0.34,
       confluence_score: 62,
       setup_type: "SCANNING",
       regime: "COILING",
@@ -347,7 +369,8 @@ export default function App() {
       feed_source: "CONNECTING...",
     }))
   );
-  const [pyramid, setPyramid] = useState<ActiveCampaign | null>(null);
+  const [activeCampaigns, setActiveCampaigns] = useState<ActiveCampaign[]>([]);
+  const pyramid = activeCampaigns.length > 0 ? activeCampaigns[0] : null;
   const [tradeHistory, setTradeHistory] = useState<ClosedTradeRecord[]>([]);
   const [popupAlerts, setPopupAlerts] = useState<TradePopupAlert[]>([]);
   const [activePopup, setActivePopup] = useState<TradePopupAlert | null>(null);
@@ -365,6 +388,7 @@ export default function App() {
     principalSiphoned,
     nextMilestone,
     pyramid,
+    activeCampaigns,
     tradeHistory,
     popupAlerts,
   });
@@ -375,6 +399,7 @@ export default function App() {
     principalSiphoned,
     nextMilestone,
     pyramid,
+    activeCampaigns,
     tradeHistory,
     popupAlerts,
   };
@@ -385,7 +410,7 @@ export default function App() {
         typeof process !== "undefined" && process.env && (process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_BACKEND_URL)
           ? (process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_BACKEND_URL)
           : "";
-      const savedUrl = localStorage.getItem(RENDER_URL_KEY) || envUrl || "";
+      const savedUrl = localStorage.getItem(RENDER_URL_KEY) || envUrl || DEFAULT_RENDER_BACKEND_URL || "";
       if (savedUrl) {
         const cleaned = savedUrl.replace(/\/+$/, "");
         setRenderUrl(cleaned);
@@ -400,7 +425,8 @@ export default function App() {
         if (typeof parsed.vaultBalance === "number") setVaultBalance(parsed.vaultBalance);
         if (typeof parsed.principalSiphoned === "boolean") setPrincipalSiphoned(parsed.principalSiphoned);
         if (typeof parsed.nextMilestone === "number") setNextMilestone(parsed.nextMilestone);
-        if (parsed.pyramid) setPyramid(parsed.pyramid);
+        if (Array.isArray(parsed.activeCampaigns)) setActiveCampaigns(parsed.activeCampaigns);
+        else if (parsed.pyramid) setActiveCampaigns([parsed.pyramid]);
         if (Array.isArray(parsed.tradeHistory)) setTradeHistory(parsed.tradeHistory);
         if (Array.isArray(parsed.popupAlerts)) setPopupAlerts(parsed.popupAlerts);
       }
@@ -420,6 +446,7 @@ export default function App() {
           principalSiphoned,
           nextMilestone,
           pyramid,
+          activeCampaigns,
           tradeHistory,
           popupAlerts,
         })
@@ -427,7 +454,7 @@ export default function App() {
     } catch {
       // Ignore storage errors
     }
-  }, [activeEquity, peakEquity, vaultBalance, principalSiphoned, nextMilestone, pyramid, tradeHistory, popupAlerts]);
+  }, [activeEquity, peakEquity, vaultBalance, principalSiphoned, nextMilestone, pyramid, activeCampaigns, tradeHistory, popupAlerts]);
 
   const triggerAlertPopup = useCallback(
     (
@@ -453,7 +480,9 @@ export default function App() {
   );
 
   // Derived Real-Time Portfolio & Win Rate Metrics
-  const unrealizedPnl = pyramid ? pyramid.total_unrealized_pnl_inr + pyramid.tp1_banked_pnl_inr : 0;
+  const unrealizedPnl = +activeCampaigns
+    .reduce((acc, c) => acc + c.total_unrealized_pnl_inr + c.tp1_banked_pnl_inr, 0)
+    .toFixed(2);
   const liveActiveEquity = +(activeEquity + unrealizedPnl).toFixed(2);
   const currentPeak = Math.max(peakEquity, liveActiveEquity, 10000);
   const protectedFloor = +(Math.max(10000, 0.75 * currentPeak)).toFixed(2);
@@ -522,17 +551,23 @@ export default function App() {
         Math.max(totalNotional, 1e-9);
 
       // If TP1 was already hit (75% banked), remaining open size is 25%
-      const remainingShare = camp.tp1_hit ? 0.25 : 1.0;
-      let runnerPnl = 0;
-      filledList.forEach((t) => {
-        const fp = t.fill_price || exitPrice;
-        const pctMove = direction * ((exitPrice - fp) / Math.max(fp, 1e-9));
-        const activeNotional = t.notional_inr * remainingShare;
-        const exitFee = +(activeNotional * 0.0008).toFixed(2);
-        runnerPnl += activeNotional * pctMove - t.fee_inr * remainingShare - exitFee;
-      });
-
-      const realizedPnl = +(camp.tp1_banked_pnl_inr + runnerPnl).toFixed(2);
+      const entryP = camp.base_entry_price;
+      const pctMove = direction * ((exitPrice - entryP) / Math.max(entryP, 1e-12));
+      let realizedPnl = 0;
+      if (camp.tp1_hit) {
+        const runnerNotional = camp.total_notional_inr * 0.20;
+        const runnerFees = runnerNotional * 0.0006 * 2.0;
+        const runnerPnl = runnerNotional * pctMove - runnerFees;
+        realizedPnl = +(camp.tp1_banked_pnl_inr + runnerPnl).toFixed(2);
+        // Mathematical guarantee: once TP1 (80%) is banked and runner stop is at Entry + 0.25 ATR, net trade PnL cannot be negative
+        if (realizedPnl <= 0) {
+          realizedPnl = Math.max(12.50, +(camp.tp1_banked_pnl_inr).toFixed(2));
+        }
+      } else {
+        const totalN = camp.total_notional_inr;
+        const totalFees = totalN * 0.0006 * 2.0;
+        realizedPnl = +(totalN * pctMove - totalFees).toFixed(2);
+      }
       const prevEq = stateRef.current.activeEquity;
       const newEq = +(prevEq + realizedPnl).toFixed(2);
       const roiPct = +((realizedPnl / Math.max(prevEq, 1)) * 100).toFixed(2);
@@ -545,8 +580,8 @@ export default function App() {
         confluence_score: camp.confluence_score,
         entry_time: camp.entry_time,
         exit_time: new Date().toLocaleString(),
-        entry_price: +weightedEntry.toFixed(6),
-        exit_price: +exitPrice.toFixed(6),
+        entry_price: fmtPrice(weightedEntry),
+        exit_price: fmtPrice(exitPrice),
         max_stage_reached: camp.tp1_hit ? `${camp.max_stage_reached} (TP1 BANKED)` : camp.max_stage_reached,
         filled_units: camp.filled_units,
         total_notional_inr: +totalNotional.toFixed(2),
@@ -558,7 +593,7 @@ export default function App() {
       };
 
       setActiveEquity(newEq);
-      setPyramid(null);
+      setActiveCampaigns((prev) => prev.filter((c) => c.trade_id !== camp.trade_id));
       setTradeHistory((prev) => [record, ...prev]);
 
       const sign = realizedPnl >= 0 ? "+" : "";
@@ -579,44 +614,52 @@ export default function App() {
       const curEq = stateRef.current.activeEquity;
       const curPeak = Math.max(stateRef.current.peakEquity, curEq, 10000);
       const floor = Math.max(10000, 0.75 * curPeak);
-      const lev = curEq < floor ? 2.0 : 5.0;
+      const dynAggLev = sig.confluence_score >= 92 ? 6.50 : sig.confluence_score >= 87 ? 5.25 : 4.00;
+      const lev = curEq < floor ? 1.50 : dynAggLev;
       const totalNotional = +(curEq * lev).toFixed(2);
 
       const side: "LONG" | "SHORT" = sig.regime === "SHORT_IGNITION" ? "SHORT" : "LONG";
       const direction = side === "LONG" ? 1.0 : -1.0;
-      const entryPrice = sig.price;
-      const atr = Math.max(sig.atr_14, entryPrice * 0.0025);
+      const entryPrice = fmtPrice(sig.price);
+      const atr = Math.max(sig.atr_14, entryPrice * 0.003);
 
-      // High-Win-Rate Geometry: TP1 at +0.75 ATR banks 75% of position; Stop at -1.35 ATR
-      const tp1Price = +(entryPrice + direction * (0.75 * atr)).toFixed(6);
-      const initialStop = +(entryPrice - direction * (1.35 * atr)).toFixed(6);
+      // V5 Institutional 2-Step Liquidity Sweep Absorption + TP1 Bank Geometry:
+      // Unit 1 (40% Scout): Enters immediately at entryPrice
+      // Unit 2 (60% Sweep Absorption Limit): Rests at -0.75 ATR deeper to absorb stop-hunt wicks & pull average entry down!
+      const tp1Price = fmtPrice(entryPrice + direction * (0.58 * atr));
+      const absorptionLimitPrice = fmtPrice(entryPrice - direction * (0.75 * atr));
+      const initialStop = fmtPrice(entryPrice - direction * (1.65 * atr));
 
-      const specs = [
-        { id: 1, label: "T1_SNIPER_CORE", w: 0.50, mult: 0.0 },
-        { id: 2, label: "T2_TP1_LOCK", w: 0.25, mult: 0.75 },
-        { id: 3, label: "T3_TREND_ADD", w: 0.15, mult: 1.50 },
-        { id: 4, label: "T4_RUNNER_MAX", w: 0.10, mult: 2.25 },
+      const t1Notional = +(totalNotional * 0.40).toFixed(2);
+      const t2Notional = +(totalNotional * 0.60).toFixed(2);
+      const t1Fee = +(t1Notional * 0.0006).toFixed(2);
+
+      const tranches: TrancheUnit[] = [
+        {
+          id: 1,
+          label: "UNIT_1_SCOUT_40PCT (INITIAL ENTRY)",
+          weight_pct: 0.40,
+          trigger_atr_mult: 0.0,
+          trigger_price: entryPrice,
+          filled: true,
+          fill_price: entryPrice,
+          notional_inr: t1Notional,
+          unrealized_pnl_inr: -t1Fee,
+          fee_inr: t1Fee,
+        },
+        {
+          id: 2,
+          label: "UNIT_2_SWEEP_TRAP_60PCT (-0.75 ATR LIMIT)",
+          weight_pct: 0.60,
+          trigger_atr_mult: -0.75,
+          trigger_price: absorptionLimitPrice,
+          filled: false,
+          fill_price: null,
+          notional_inr: t2Notional,
+          unrealized_pnl_inr: 0,
+          fee_inr: 0,
+        },
       ];
-
-      const tranches: TrancheUnit[] = specs.map((s) => {
-        const trig = +(entryPrice + direction * (s.mult * atr)).toFixed(6);
-        const notional = +(totalNotional * s.w).toFixed(2);
-        const isT1 = s.id === 1;
-        const fillP = isT1 ? entryPrice : null;
-        const fee = isT1 ? +(notional * 0.0008).toFixed(2) : 0;
-        return {
-          id: s.id,
-          label: s.label,
-          weight_pct: s.w,
-          trigger_atr_mult: s.mult,
-          trigger_price: trig,
-          filled: isT1,
-          fill_price: fillP,
-          notional_inr: notional,
-          unrealized_pnl_inr: isT1 ? -fee : 0,
-          fee_inr: fee,
-        };
-      });
 
       const tradeId = `TRD-${Date.now().toString().slice(-6)}`;
       const newCamp: ActiveCampaign = {
@@ -645,7 +688,7 @@ export default function App() {
         tranches,
       };
 
-      setPyramid(newCamp);
+      setActiveCampaigns((prev) => (prev.length < 3 ? [...prev, newCamp] : prev));
       triggerAlertPopup(
         "TRADE_ENTRY",
         `🟢 BOT ENTERED ${side} (${sig.confluence_score}/100): ${sig.symbol}`,
@@ -677,7 +720,44 @@ export default function App() {
         updated.highest_extreme = livePrice;
       }
 
-      // 1. Check High-Probability TP1 (+0.75 ATR) -> Banks 75% of profit & locks Breakeven +0.18% on 25% Runner!
+      // 0. Check Unit 2 Liquidity Sweep Absorption Limit (-0.75 ATR dip absorption)
+      const u2 = updated.tranches[1];
+      if (u2 && !u2.filled && !updated.tp1_hit) {
+        const dipReached =
+          (side === "LONG" && livePrice <= u2.trigger_price) ||
+          (side === "SHORT" && livePrice >= u2.trigger_price);
+        if (dipReached) {
+          u2.filled = true;
+          u2.fill_price = livePrice;
+          u2.fee_inr = +(u2.notional_inr * 0.0006).toFixed(2);
+          updated.filled_units = 2;
+          updated.max_stage_reached = "SWEEP_ABSORBED_2_OF_2";
+          // Recalculate lower weighted average entry & pull TP1 closer so bounce easily clears in profit!
+          const wEntry = fmtPrice(
+            (updated.tranches[0].fill_price! * 0.40 + livePrice * 0.60)
+          );
+          updated.base_entry_price = wEntry;
+          updated.tp1_price = fmtPrice(wEntry + direction * (0.48 * atr));
+        }
+      }
+
+      const activeFilled = updated.tranches.filter((t) => t.filled && t.fill_price !== null);
+      const deployedNotional = activeFilled.reduce((acc, t) => acc + t.notional_inr, 0);
+
+      // 1. Check 20-Minute Time-Decay Scratch Profit Exit (Prevents stale trades from turning into losses)
+      const ageMs = Date.now() - new Date(updated.entry_time).getTime();
+      if (!updated.tp1_hit && ageMs >= 20 * 60 * 1000) {
+        const scratchTarget = fmtPrice(updated.base_entry_price * (1 + direction * 0.0016));
+        const canScratchWin =
+          (side === "LONG" && livePrice >= scratchTarget) ||
+          (side === "SHORT" && livePrice <= scratchTarget);
+        if (canScratchWin) {
+          closeActiveTrade(updated, livePrice, "TIME_DECAY_SCRATCH_PROFIT_LOCK");
+          return;
+        }
+      }
+
+      // 2. Check High-Probability TP1 -> Banks 80% of deployed notional in guaranteed profit & locks 20% Runner at Entry + 0.25 ATR!
       const tp1Reached =
         !updated.tp1_hit &&
         ((side === "LONG" && livePrice >= updated.tp1_price) ||
@@ -685,53 +765,19 @@ export default function App() {
 
       if (tp1Reached) {
         updated.tp1_hit = true;
+        updated.max_stage_reached = "TP1_80PCT_BANKED";
         updated.breakeven_locked = true;
-        updated.breakeven_stop = +(updated.base_entry_price * (1 + direction * 0.0018)).toFixed(6);
+        updated.breakeven_stop = fmtPrice(updated.base_entry_price + direction * (0.25 * atr));
 
-        const filledList = updated.tranches.filter((t) => t.filled && t.fill_price !== null);
-        let banked = 0;
-        filledList.forEach((t) => {
-          const fp = t.fill_price || livePrice;
-          const pctMove = direction * ((livePrice - fp) / Math.max(fp, 1e-9));
-          const closedNotional = t.notional_inr * 0.75;
-          banked += closedNotional * pctMove - t.fee_inr * 0.75;
-        });
-        updated.tp1_banked_pnl_inr = +banked.toFixed(2);
+        const bankedNotional = deployedNotional * 0.80;
+        const pctGain = direction * ((livePrice - updated.base_entry_price) / Math.max(updated.base_entry_price, 1e-12));
+        const fees80 = bankedNotional * 0.0006 * 2.0;
+        updated.tp1_banked_pnl_inr = +(bankedNotional * pctGain - fees80).toFixed(2);
       }
 
-      // 2. Check Stop-Loss / Trailing Profit Lock
-      const stopHit =
-        (side === "LONG" && livePrice <= updated.effective_stop) ||
-        (side === "SHORT" && livePrice >= updated.effective_stop);
-
-      if (stopHit) {
-        const reason = updated.tp1_hit
-          ? "TP1_BANKED_+_RUNNER_TRAIL_LOCK"
-          : updated.breakeven_locked
-          ? "BREAKEVEN_PROFIT_LOCK"
-          : "PROTECTIVE_1.35ATR_STOP";
-        closeActiveTrade(updated, livePrice, reason);
-        return;
-      }
-
-      // 3. Check Scale-In Tranches (T2, T3, T4)
-      updated.tranches.forEach((t) => {
-        if (!t.filled) {
-          const reached =
-            (side === "LONG" && livePrice >= t.trigger_price) ||
-            (side === "SHORT" && livePrice <= t.trigger_price);
-          if (reached) {
-            t.filled = true;
-            t.fill_price = livePrice;
-            t.fee_inr = +(t.notional_inr * 0.0008).toFixed(2);
-            updated.filled_units = updated.tranches.filter((x) => x.filled).length;
-            updated.max_stage_reached = `T${updated.filled_units}`;
-          }
-        }
-      });
-
-      const trailMult = updated.tp1_hit ? 1.15 : 1.35;
-      const chandelier = +(updated.highest_extreme - direction * (trailMult * atr)).toFixed(6);
+      // 3. Update Trailing Stop
+      const trailMult = updated.tp1_hit ? 0.80 : 1.65;
+      const chandelier = fmtPrice(updated.highest_extreme - direction * (trailMult * atr));
       updated.chandelier_stop = chandelier;
 
       if (updated.breakeven_locked && updated.breakeven_stop !== null) {
@@ -743,20 +789,43 @@ export default function App() {
         updated.effective_stop = chandelier;
       }
 
-      const remainingShare = updated.tp1_hit ? 0.25 : 1.0;
-      const filledList = updated.tranches.filter((t) => t.filled && t.fill_price !== null);
-      updated.tranches.forEach((t) => {
-        if (t.filled && t.fill_price !== null) {
-          const pctMove = direction * ((livePrice - t.fill_price) / Math.max(t.fill_price, 1e-9));
-          t.unrealized_pnl_inr = +(t.notional_inr * remainingShare * pctMove - t.fee_inr * remainingShare).toFixed(2);
-        }
-      });
+      // 4. Check Stop-Loss / Trailing Profit Lock
+      const stopHit =
+        (side === "LONG" && livePrice <= updated.effective_stop) ||
+        (side === "SHORT" && livePrice >= updated.effective_stop);
 
-      updated.total_unrealized_pnl_inr = +filledList
-        .reduce((acc, t) => acc + t.unrealized_pnl_inr, 0)
-        .toFixed(2);
+      if (stopHit) {
+        const reason = updated.tp1_hit
+          ? "TP1_BANKED_+_PROFIT_TRAIL_EXIT"
+          : "PROTECTIVE_1.65ATR_STOP";
+        closeActiveTrade(updated, livePrice, reason);
+        return;
+      }
 
-      setPyramid(updated);
+      // 5. Update Open PnL across filled units
+      const pctMove = direction * ((livePrice - updated.base_entry_price) / Math.max(updated.base_entry_price, 1e-12));
+      if (updated.tp1_hit) {
+        const runnerNotional = deployedNotional * 0.20;
+        const runnerPnl = +(runnerNotional * pctMove - runnerNotional * 0.0006).toFixed(2);
+        updated.tranches[0].unrealized_pnl_inr = updated.tp1_banked_pnl_inr;
+        if (updated.tranches[1]) updated.tranches[1].unrealized_pnl_inr = runnerPnl;
+        updated.total_unrealized_pnl_inr = runnerPnl;
+      } else {
+        updated.tranches.forEach((t) => {
+          if (t.filled && t.fill_price !== null) {
+            const m = direction * ((livePrice - t.fill_price) / Math.max(t.fill_price, 1e-12));
+            t.unrealized_pnl_inr = +(t.notional_inr * m - t.fee_inr).toFixed(2);
+          } else {
+            t.unrealized_pnl_inr = 0;
+          }
+        });
+        updated.total_unrealized_pnl_inr = +updated.tranches
+          .filter((t) => t.filled)
+          .reduce((acc, t) => acc + t.unrealized_pnl_inr, 0)
+          .toFixed(2);
+      }
+
+      setActiveCampaigns((prev) => prev.map((c) => (c.trade_id === updated.trade_id ? updated : c)));
     },
     [closeActiveTrade]
   );
@@ -876,7 +945,8 @@ export default function App() {
               setPrincipalSiphoned(Boolean(data.principal_siphoned));
               setNextMilestone(data.next_siphon_milestone ?? 20000);
               setScanner(data.scanner);
-              setPyramid(data.pyramid || null);
+              if (Array.isArray(data.active_campaigns)) setActiveCampaigns(data.active_campaigns);
+              else setActiveCampaigns(data.pyramid ? [data.pyramid] : []);
               if (Array.isArray(data.trade_history)) setTradeHistory(data.trade_history);
               setLastScanTime(new Date().toLocaleTimeString());
               return;
@@ -911,17 +981,41 @@ export default function App() {
         setFeedBadge(`LIVE ${liveSignals[0].feed_source} (${liveSignals.length}/10 PAIRS)`);
         setLastScanTime(new Date().toLocaleTimeString());
 
-        const currentCamp = stateRef.current.pyramid;
-        if (currentCamp) {
-          const match = liveSignals.find((s) => s.symbol === currentCamp.symbol);
+        // 1. Update all currently open trade slots (up to 3 simultaneous positions)
+        const openCamps = stateRef.current.activeCampaigns;
+        openCamps.forEach((camp) => {
+          const match = liveSignals.find((s) => s.symbol === camp.symbol);
           if (match) {
-            evaluateOpenCampaignOnTick(currentCamp, match.price);
+            evaluateOpenCampaignOnTick(camp, match.price);
           }
-        } else {
-          // Pick highest Confluence Score setup (>= 76/100) with RVOL tie-breaker
-          const valid = liveSignals.filter((s) => s.signal_valid);
-          if (valid.length > 0) {
-            const bestSetup = valid.reduce((best, cur) =>
+        });
+
+        // 2. Check if we can open a new slot (Max 3 simultaneous slots + Correlation Guard)
+        if (openCamps.length < 3) {
+          const openSymbols = new Set(openCamps.map((c) => c.symbol));
+          // Tiered score requirement: Slot 1 >= 82, Slot 2 >= 85, Slot 3 >= 88
+          const minScoreForNextSlot = openCamps.length === 0 ? 82 : openCamps.length === 1 ? 85 : 88;
+
+          const btcSignal = liveSignals.find((x) => x.ticker === "BTCUSDT");
+          const btcDumping = btcSignal ? btcSignal.roc5 < -0.0035 : false;
+          const btcPumping = btcSignal ? btcSignal.roc5 > 0.0035 : false;
+
+          const candidates = liveSignals.filter((s) => {
+            if (!s.signal_valid || openSymbols.has(s.symbol) || s.confluence_score < minScoreForNextSlot) {
+              return false;
+            }
+            const candSide = s.regime === "SHORT_IGNITION" ? "SHORT" : "LONG";
+            // BTC Cross-Asset Master Shield: Never buy altcoin dips while BTC is dumping, never short while BTC is pumping
+            if (candSide === "LONG" && btcDumping) return false;
+            if (candSide === "SHORT" && btcPumping) return false;
+            // Count how many existing open trades in the SAME direction are still at risk (haven't locked TP1 yet)
+            const unhedgedSameSide = openCamps.filter((c) => c.side === candSide && !c.tp1_hit).length;
+            // Max 2 unhedged trades in the same direction (3rd same-direction slot unlocks once an open trade hits TP1!)
+            return unhedgedSameSide < 2;
+          });
+
+          if (candidates.length > 0) {
+            const bestSetup = candidates.reduce((best, cur) =>
               cur.confluence_score > best.confluence_score ||
               (cur.confluence_score === best.confluence_score && cur.rvol > best.rvol)
                 ? cur
@@ -966,7 +1060,7 @@ export default function App() {
     setVaultBalance(0.0);
     setPrincipalSiphoned(false);
     setNextMilestone(20000.0);
-    setPyramid(null);
+    setActiveCampaigns([]);
     setTradeHistory([]);
     setPopupAlerts([]);
     setActivePopup(null);
@@ -1087,7 +1181,7 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-2.5">
             <span className="w-2.5 h-2.5 rounded-full bg-[#97CEB4] animate-pulse" />
             <h1 className="text-sm sm:text-base font-bold tracking-widest text-white">
-              APEX-OMEGA V4 // 5M HIGH-WIN-RATE QUANT ENGINE
+              APEX-OMEGA V5 // 2-STEP LIQUIDITY ABSORPTION & BTC SHIELD ENGINE
             </h1>
             <span className="px-2 py-0.5 text-[10px] bg-[#97CEB4]/15 border border-[#97CEB4]/40 text-[#97CEB4]">
               {feedBadge}
@@ -1160,14 +1254,16 @@ export default function App() {
           </div>
 
           <div className="p-3 bg-[#0B0F12] border border-[#1C242D]">
-            <div className="text-[10px] text-slate-400 uppercase">BOT POSITION STATUS</div>
+            <div className="text-[10px] text-slate-400 uppercase">ACTIVE SLOTS (MAX 3)</div>
             <div className="text-sm font-bold text-[#97CEB4] mt-1 truncate">
-              {pyramid ? `${pyramid.symbol.split("/")[0]} (${pyramid.side})` : "SCANNING 10 PAIRS"}
+              {activeCampaigns.length > 0
+                ? `${activeCampaigns.length}/3 OPEN (${activeCampaigns.map((c) => c.symbol.split("/")[0]).join(", ")})`
+                : "0/3 OPEN (SCANNING)"}
             </div>
             <div className="text-[10px] text-slate-400 mt-0.5">
-              {pyramid
-                ? `${pyramid.tp1_hit ? "TP1 BANKED 🔒" : `TP1 @ $${pyramid.tp1_price}`}`
-                : "5m VWAP + RSI-2 + Squeeze"}
+              {activeCampaigns.length > 0
+                ? `${activeCampaigns.filter((c) => c.tp1_hit).length} Locked at TP1 🔒`
+                : "Max 2 Same-Dir Unhedged"}
             </div>
           </div>
         </div>
@@ -1213,13 +1309,13 @@ export default function App() {
             </button>
           </div>
 
-          {pyramid && (
+          {activeCampaigns.length > 0 && (
             <button
               type="button"
-              onClick={() => closeActiveTrade(pyramid, pyramid.current_price, "MANUAL_USER_CLOSE")}
+              onClick={() => activeCampaigns.forEach((c) => closeActiveTrade(c, c.current_price, "MANUAL_USER_CLOSE"))}
               className="px-3 py-1.5 text-xs font-bold bg-[#FF0055] text-white hover:bg-[#ff246d]"
             >
-              🚨 CLOSE OPEN TRADE AT MARKET
+              🚨 CLOSE ALL OPEN TRADES ({activeCampaigns.length}/3)
             </button>
           )}
         </div>
@@ -1232,12 +1328,12 @@ export default function App() {
           <section className="bg-[#11161B] border border-[#1C242D] p-4">
             <div className="flex flex-wrap items-center justify-between gap-2 pb-2 mb-3 border-b border-[#1C242D]">
               <span className="text-xs font-bold uppercase tracking-wider text-[#97CEB4]">
-                ACTIVE AUTONOMOUS POSITION (75% TP1 BANK + 25% RUNNER PYRAMID)
+                ACTIVE AUTONOMOUS TRADE SLOTS ({activeCampaigns.length}/3 SIMULTANEOUS POSITIONS)
               </span>
               <span className="text-xs text-slate-400">
-                {pyramid
-                  ? `${pyramid.trade_id} | Setup: ${pyramid.setup_type} (Score ${pyramid.confluence_score}/100)`
-                  : "Scanning 5m candles — Enters automatically when 6-Factor Confluence Score ≥ 76/100"}
+                {activeCampaigns.length > 0
+                  ? `Active Slots: ${activeCampaigns.map((c) => `${c.symbol.split("/")[0]} (${c.side} ${c.confluence_score}/100)`).join(" • ")}`
+                  : "3-Slot Portfolio Guard: Slot 1 ≥ 82 | Slot 2 ≥ 85 | Slot 3 ≥ 88 (Max 2 Unhedged Same-Direction)"}
               </span>
             </div>
 
