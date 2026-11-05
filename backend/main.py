@@ -481,7 +481,6 @@ async def start_background_scanner() -> None:
     asyncio.create_task(loop())
 
 
-@app.api_route("/", methods=["GET", "HEAD"])
 @app.api_route("/health", methods=["GET", "HEAD"])
 @app.api_route("/api/ping", methods=["GET", "HEAD"])
 async def health_check() -> Dict[str, Any]:
@@ -531,3 +530,22 @@ async def reset_account() -> Dict[str, Any]:
     daemon.state["pair_cooldowns"] = {}
     daemon.save_state()
     return {"status": "RESET_OK", "telemetry": daemon.build_payload()}
+
+
+# -------------------------------------------------------------
+# Unified Command Center Dashboard Static Mount (Single Server)
+# -------------------------------------------------------------
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if not os.path.exists(static_dir):
+    static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backend", "static")
+if not os.path.exists(static_dir):
+    static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+
+if os.path.exists(static_dir):
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="dashboard")
+    print(f"Dashboard static files mounted successfully from: {static_dir}")
+else:
+    @app.api_route("/", methods=["GET", "HEAD"])
+    async def fallback_root():
+        return {"status": "ONLINE_24_7", "service": "APEX-OMEGA OS Backend"}
